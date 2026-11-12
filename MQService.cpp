@@ -1,13 +1,16 @@
 #ifdef WITH_POSTGRESQL
 
 #include "MQService/MQService.hpp"
+#include "MQService/OwnPool.hpp"
 
 #include "apostol/application.hpp"
 
+#include <fmt/format.h>
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
 #include <cctype>
+#include <stdexcept>
 
 namespace apostol
 {
@@ -36,41 +39,97 @@ bool MQService::parse_mode(std::string_view s, Mode& out) noexcept
 
 void MQService::on_start(EventLoop& loop, Application& app)
 {
-    pool_   = &app.db_pool();
     logger_ = &app.logger();
     loop_   = &loop;
 
-    // apibot authentication (OAuth2 client_credentials), as the other processes do.
-    bot_ = std::make_unique<BotSession>(*pool_, "MQService/2.0", "127.0.0.1");
-
-    auto [client_id, client_secret] = app.providers().credentials("service");
-    if (!client_id.empty())
-        bot_->set_credentials(std::move(client_id), std::move(client_secret));
+    // The process's own login, from configuration alone and before anything is
+    // built: a missing or wrong postgres.exchange is refused here, by name —
+    // not later by the database, at every call, as a bare access error.
+    std::string own_conninfo;
+    std::string own_role;
+    {
+        const auto& root = app.config().json();
+        nlohmann::json section;
+        if (const auto pg = root.find("postgres"); pg != root.end() && pg->is_object() && pg->contains("exchange"))
+            section = pg->at("exchange");
+        try {
+            const auto& st = app.settings();
+            own_conninfo = mqservice::own_conninfo(st.pg_conninfo_helper, section, "postgres.exchange",
+                                                   {st.pg_conninfo_worker, st.pg_conninfo_kernel});
+        } catch (const std::exception& e) {
+            throw std::runtime_error(fmt::format(
+                "MQService: {} — the exchange connects as a database role of its own, never the helper's; "
+                "refusing to start", e.what()));
+        }
+        own_role = section.at("user").get<std::string>();
+    }
 
     load_config(app);
 
-    // Deliberate: the first session fires on the first heartbeat after the bot
-    // authenticates, not one interval later. A node that has just come up — on a
-    // vessel, after a restart that is itself an event — should catch up at once,
-    // not sit a full interval behind. Leaving next_tick_ at the epoch would give
-    // the same effect by accident; setting it here makes it a decision.
-    next_tick_ = std::chrono::system_clock::now();
+    // The pool as the framework sets up a custom process's own: lazy, no
+    // connection before the first query. From here on a throw takes the pool
+    // with it — a PgPool outliving the loop it is registered with would be
+    // destroyed into a dead loop.
+    try {
+        // Not the process's logger: its file target would put every pool line
+        // (Connected, LISTEN, a notice per NOTIFY, a failed result) into the
+        // error log. The framework's pools, without a postgres log, write to
+        // stderr at log.level — this one does the same.
+        pool_logger_ = std::make_unique<Logger>();
+        pool_logger_->add_target(std::make_unique<StderrTarget>());
+        pool_logger_->set_level(app.logger().level());
 
-    // Runtime control channel. The callback only enqueues; commands are applied
-    // in the heartbeat, off the notify dispatch path.
-    pool_->listen("mq_cmd", [this](std::string_view /*channel*/, std::string_view payload) {
-        on_command(payload);
-    });
+        const auto& st = app.settings();
+        own_pool_ = std::make_unique<PgPool>(loop, std::move(own_conninfo),
+            static_cast<std::size_t>(st.pg_pool_min), static_cast<std::size_t>(st.pg_pool_max), pool_logger_.get());
+        own_pool_->set_reset(st.pg_reset);
+        own_pool_->set_stall_timeout(std::chrono::seconds(st.pg_stall_timeout));
+        own_pool_->set_idle_timeout(std::chrono::seconds(st.pg_pool_idle_timeout));
+        own_pool_->set_lifetime(std::chrono::seconds(st.pg_pool_lifetime));
+        own_pool_->set_lazy(true);
+        own_pool_->start();
 
-    logger_->notice("MQService started (mode={}, interval={}ms) — skeleton: exchange session not implemented yet",
-                    mode_name(mode_), interval_.count());
+        // Every minute, as the framework's own pool timer: health, the minimum,
+        // idle connections, the recovery of the LISTEN connection. A timer of its
+        // own, not the module heartbeat: that one is gated (process.leader) and
+        // returns early before the service session exists.
+        pool_timer_ = loop.add_timer(std::chrono::duration_cast<std::chrono::milliseconds>(k_pool_beat),
+                                     [this] { if (own_pool_) own_pool_->heartbeat(); });
+
+        // Service authentication (OAuth2 client_credentials), on the own pool.
+        bot_ = std::make_unique<BotSession>(*own_pool_, "MQService/2.0", "127.0.0.1");
+
+        auto [client_id, client_secret] = app.providers().credentials("service");
+        if (!client_id.empty())
+            bot_->set_credentials(std::move(client_id), std::move(client_secret));
+
+        // Deliberate: the first session fires on the first heartbeat after the bot
+        // authenticates, not one interval later. A node that has just come up — on a
+        // vessel, after a restart that is itself an event — should catch up at once,
+        // not sit a full interval behind. Leaving next_tick_ at the epoch would give
+        // the same effect by accident; setting it here makes it a decision.
+        next_tick_ = std::chrono::system_clock::now();
+
+        // Runtime control channel. The callback only enqueues; commands are applied
+        // in the heartbeat, off the notify dispatch path.
+        own_pool_->listen("mq_cmd", [this](std::string_view /*channel*/, std::string_view payload) {
+            on_command(payload);
+        });
+
+        logger_->notice("MQService started (mode={}, interval={}ms, database role '{}' from postgres.exchange) — "
+                        "skeleton: exchange session not implemented yet",
+                        mode_name(mode_), interval_.count(), own_role);
+    } catch (...) {
+        release_pool();
+        throw;
+    }
 }
 
 // ─── heartbeat ───────────────────────────────────────────────────────────────
 
 void MQService::heartbeat(std::chrono::system_clock::time_point now)
 {
-    if (!bot_ || !pool_)
+    if (!bot_ || !own_pool_)
         return;
 
     bot_->refresh_if_needed();
@@ -108,15 +167,73 @@ void MQService::heartbeat(std::chrono::system_clock::time_point now)
     }
 }
 
-// ─── on_stop ─────────────────────────────────────────────────────────────────
+// ─── on_stopping / busy / on_stop ────────────────────────────────────────────
+//
+// The framework's stop, done here for the pool it did not open: the pool timer
+// cancelled and notifications muted first (on_stopping — the stop re-runs the
+// loop), the work in flight waited for within the stop budget (busy), then in
+// on_stop — in the framework's own order — detach, and the pool destroyed while
+// the loop still lives. BotSession::sign_out() sends nothing: the service
+// session outlives the process by design and is handed back on the next start.
+
+void MQService::cancel_pool_timer() noexcept
+{
+    if (pool_timer_ != EventLoop::kInvalidTimer && loop_) {
+        try { loop_->cancel_timer(pool_timer_); } catch (...) {}
+    }
+    pool_timer_ = EventLoop::kInvalidTimer;
+}
+
+void MQService::release_pool() noexcept
+{
+    cancel_pool_timer();
+    bot_.reset();
+    own_pool_.reset();
+    pool_logger_.reset();
+}
+
+void MQService::on_stopping()
+{
+    cancel_pool_timer();
+    if (own_pool_)
+        own_pool_->mute_listeners();
+}
+
+bool MQService::busy() const
+{
+    if (!own_pool_)
+        return false;
+    // As the framework's finish_work does for its own pools: once a round, a
+    // query with nowhere to run is failed (PgPool::fail_stranded steps from
+    // waiting, to an attempt, to failing — one step per call, so not on every
+    // evaluation of this predicate). The framework's round timer wakes the loop.
+    const auto now = std::chrono::steady_clock::now();
+    if (next_round_ == std::chrono::steady_clock::time_point{})
+        next_round_ = now + k_round;
+    else if (now >= next_round_) {
+        next_round_ = now + k_round;
+        own_pool_->fail_stranded("no connection to the database, and the process is stopping", k_round);
+    }
+    return own_pool_->outstanding() > 0;
+}
 
 void MQService::on_stop()
 {
-    if (pool_)
-        pool_->unlisten("mq_cmd");
-    if (bot_)
-        bot_->sign_out();
-    bot_.reset();
+    // Whatever happens before it, the pool is destroyed here, while the loop
+    // lives: after on_stop nothing of the framework stops a pool it did not open.
+    try {
+        if (own_pool_) {
+            own_pool_->unlisten("mq_cmd");
+            own_pool_->detach();   // a late result is not delivered to what is released below
+        }
+        if (bot_)
+            bot_->sign_out();
+    } catch (const std::exception& e) {
+        if (logger_)
+            logger_->warn("MQService: stop: {}", e.what());
+    } catch (...) {
+    }
+    release_pool();
 }
 
 // ─── on_command / process_command_queue ──────────────────────────────────────
@@ -216,7 +333,7 @@ void MQService::apply_command(std::string_view payload)
             logger_->notice("MQService: sync requested (all channels)");
         else
             logger_->notice("MQService: sync requested (channel={})", channel);
-        // The channel scope is carried by the exchange card; the skeleton only
+        // The channel scope is carried by the exchange step; the skeleton only
         // records that a session was asked for.
         sync_requested_ = true;
     } else {
@@ -229,7 +346,7 @@ void MQService::apply_command(std::string_view payload)
 // Stub. The real session — collect a batch by channel with a priority filter,
 // one compressed HTTP round-trip, apply inbound through each class's `ingest`,
 // confirm watermarks moved by the RECEIVER on receipt — arrives with the mq
-// schema (T078) as a separate card. Nothing here touches the database: the
+// schema as a separate step. Nothing here touches the database: the
 // schema does not exist yet, and there is to be no raw DML at any point.
 //
 
