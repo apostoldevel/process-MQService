@@ -33,7 +33,7 @@ Application
         └── MQService (ProcessModule: business logic only)
 ```
 
-The process lifecycle (signal handling, crash recovery, the heartbeat timer) is owned by the generic `ModuleProcess` shell. The framework beats and stops only the pools it opened, so `MQService` does that for its own pool: a pool timer every 60 s, `on_stopping` cancels it and mutes the pool's notifications, `busy` waits for the work in flight (once a round failing a query with no connection), `on_stop` detaches the pool and destroys it while the loop lives. The service session is not closed at stop — it outlives the process by design and is handed back on the next start.
+The process lifecycle (signal handling, crash recovery, the heartbeat timer) is owned by the generic `ModuleProcess` shell. The framework beats and stops only the pools it opened, so `MQService` does that for its own pool: a pool timer every 60 s, `on_stopping` cancels it, mutes the pool's notifications and starts the stop round, which fails a query with no connection — the framework's own round: a quarter of the stop budget or of `process.stop_timeout`, whichever is shorter, and at most 1.5 s — `busy` waits for the work in flight, `on_stop` detaches the pool and destroys it while the loop lives. The service session is not closed at stop — it outlives the process by design and is handed back on the next start.
 
 ### How it works (today)
 

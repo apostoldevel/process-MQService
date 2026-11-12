@@ -80,6 +80,14 @@ void MQService::on_start(EventLoop& loop, Application& app)
         pool_logger_->set_level(app.logger().level());
 
         const auto& st = app.settings();
+
+        // The stop round, before the pool exists: finish_work's own formula
+        // (libapostol, Application::finish_work) — a quarter of the stop budget
+        // or of the time to the master's SIGKILL, whichever is shorter, at most
+        // k_shutdown_drain — so that three rounds fit before either.
+        const auto kill_after = std::chrono::duration_cast<milliseconds>(std::chrono::seconds(st.stop_timeout));
+        round_ = std::min<milliseconds>(Application::k_shutdown_drain, std::min(app.stop_budget(), kill_after) / 4);
+
         own_pool_ = std::make_unique<PgPool>(loop, std::move(own_conninfo),
             static_cast<std::size_t>(st.pg_pool_min), static_cast<std::size_t>(st.pg_pool_max), pool_logger_.get());
         own_pool_->set_reset(st.pg_reset);
@@ -169,24 +177,26 @@ void MQService::heartbeat(std::chrono::system_clock::time_point now)
 
 // ─── on_stopping / busy / on_stop ────────────────────────────────────────────
 //
-// The framework's stop, done here for the pool it did not open: the pool timer
-// cancelled and notifications muted first (on_stopping — the stop re-runs the
-// loop), the work in flight waited for within the stop budget (busy), then in
-// on_stop — in the framework's own order — detach, and the pool destroyed while
-// the loop still lives. BotSession::sign_out() sends nothing: the service
+// The framework's stop, done here for the pool it did not open: in on_stopping
+// the beat cancelled, notifications muted (the stop re-runs the loop) and the
+// stop round started — a query with no connection is failed, as finish_work
+// does for the framework's pools; busy() waits for the work in flight within
+// the stop budget; then in on_stop — in the framework's own order — detach, the
+// timers cancelled and the pool destroyed while the loop still lives. BotSession::sign_out() sends nothing: the service
 // session outlives the process by design and is handed back on the next start.
 
-void MQService::cancel_pool_timer() noexcept
+void MQService::cancel_timer(int& id) noexcept
 {
-    if (pool_timer_ != EventLoop::kInvalidTimer && loop_) {
-        try { loop_->cancel_timer(pool_timer_); } catch (...) {}
+    if (id != EventLoop::kInvalidTimer && loop_) {
+        try { loop_->cancel_timer(id); } catch (...) {}
     }
-    pool_timer_ = EventLoop::kInvalidTimer;
+    id = EventLoop::kInvalidTimer;
 }
 
 void MQService::release_pool() noexcept
 {
-    cancel_pool_timer();
+    cancel_timer(pool_timer_);
+    cancel_timer(stop_timer_);
     bot_.reset();
     own_pool_.reset();
     pool_logger_.reset();
@@ -194,27 +204,44 @@ void MQService::release_pool() noexcept
 
 void MQService::on_stopping()
 {
-    cancel_pool_timer();
-    if (own_pool_)
-        own_pool_->mute_listeners();
+    cancel_timer(pool_timer_);
+    if (!own_pool_)
+        return;
+    own_pool_->mute_listeners();
+
+    // As finish_work does for the framework's pools, from the start of the stop:
+    // every round, a query with nowhere to run — the database gone, no
+    // connection up or connecting — is failed (PgPool::fail_stranded: waiting,
+    // an attempt, failing — one step a call). A timer of its own: its handlers
+    // run in the loop's dispatch, and it wakes the loop when nothing else does.
+    // What a failed query's handler throws stays here: out of the timer it
+    // would end the stop's finish for the whole process. Cancelled in on_stop.
+    cancel_timer(stop_timer_);
+    try {
+        stop_timer_ = loop_->add_timer(round_, [this] {
+            if (!own_pool_)
+                return;
+            try {
+                const auto n = own_pool_->fail_stranded("no connection to the database, and the process is stopping",
+                                                        round_);
+                if (n > 0 && logger_)
+                    logger_->warn("MQService: stop: {} database {} failed — no connection to the database",
+                                  n, n == 1 ? "query" : "queries");
+            } catch (const std::exception& e) {
+                if (logger_)
+                    logger_->warn("MQService: stop: failing queries with no connection: {}", e.what());
+            } catch (...) {
+            }
+        });
+    } catch (const std::exception& e) {
+        if (logger_)
+            logger_->warn("MQService: stop: queries with no connection will not be failed: {}", e.what());
+    }
 }
 
 bool MQService::busy() const
 {
-    if (!own_pool_)
-        return false;
-    // As the framework's finish_work does for its own pools: once a round, a
-    // query with nowhere to run is failed (PgPool::fail_stranded steps from
-    // waiting, to an attempt, to failing — one step per call, so not on every
-    // evaluation of this predicate). The framework's round timer wakes the loop.
-    const auto now = std::chrono::steady_clock::now();
-    if (next_round_ == std::chrono::steady_clock::time_point{})
-        next_round_ = now + k_round;
-    else if (now >= next_round_) {
-        next_round_ = now + k_round;
-        own_pool_->fail_stranded("no connection to the database, and the process is stopping", k_round);
-    }
-    return own_pool_->outstanding() > 0;
+    return own_pool_ && own_pool_->outstanding() > 0;
 }
 
 void MQService::on_stop()

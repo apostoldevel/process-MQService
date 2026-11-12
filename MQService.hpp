@@ -98,19 +98,18 @@ private:
 
     // ── State ────────────────────────────────────────────────────────────────
 
-    static constexpr auto k_pool_beat = std::chrono::seconds(60);          // as the framework's pool timer
-    static constexpr auto k_round     = std::chrono::milliseconds(1'500);  // fail_stranded at stop: once a round, as the framework
+    static constexpr auto k_pool_beat = std::chrono::seconds(60);   // as the framework's pool timer
 
     // The process's own pool, as role postgres.exchange.user (OwnPool.hpp) —
     // never the process's helper pool. The framework neither beats nor stops a
-    // pool it did not open: pool_timer_, on_stopping(), busy() and on_stop()
+    // pool it did not open: the two timers, on_stopping(), busy() and on_stop()
     // do it here. Order matters: pool_logger_ outlives own_pool_ (~PgPool logs
     // into it), own_pool_ outlives bot_ (BotSession holds a reference to it).
     std::unique_ptr<Logger>  pool_logger_;   // stderr at log.level (README: Logging)
     std::unique_ptr<PgPool>  own_pool_;
-    int                      pool_timer_{-1}; // EventLoop::TimerId; -1 = none
-
-    mutable std::chrono::steady_clock::time_point next_round_{};   // busy(): the next fail_stranded
+    int                      pool_timer_{-1}; // EventLoop::TimerId of the beat; -1 = none
+    int                      stop_timer_{-1}; // EventLoop::TimerId of the stop round, from on_stopping()
+    milliseconds             round_{0};       // the stop round, set in on_start() before the pool
 
     Logger*     logger_{nullptr};   // borrowed from Application
     EventLoop*  loop_{nullptr};     // borrowed from Application
@@ -145,7 +144,7 @@ private:
     void run_session();   // stub until the exchange step; see the class comment
 
     void load_config(Application& app);
-    void cancel_pool_timer() noexcept;
+    void cancel_timer(int& id) noexcept;
     void release_pool() noexcept;
 
     static const char* mode_name(Mode m) noexcept;
